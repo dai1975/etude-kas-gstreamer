@@ -146,7 +146,7 @@ impl_scope! {
                             *mgr |= a;
                         }
                     }
-                    let _ = mgr.request_update(self.id(), 3939, self.video_watcher_interval, false);
+                    let _ = mgr.request_update(self.id(), 3939, self.video_watcher_interval, true);
                     Response::Used
                 }
                 _ => {
