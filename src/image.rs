@@ -1,82 +1,161 @@
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License in the LICENSE-APACHE file or at:
-//     https://www.apache.org/licenses/LICENSE-2.0
-
-//! 2D pixmap widget
-
-use crate::video;
-use kas::draw::ImageHandle;
-use kas::layout::PixmapScaling;
 use kas::prelude::*;
-use std::sync::{Arc, Mutex};
-//use kas_widgets::Image as KasImage;
+use kas::resvg::{tiny_skia, tiny_skia::Pixmap, Canvas, CanvasProgram};
 //use log::{error, info};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
+};
+
+#[derive(Debug, Clone)]
+struct ImageProgramData {
+    pixmap: Option<Pixmap>,
+}
+impl ImageProgramData {
+    pub fn new(name: &str) -> (ImageProgramDrawer, ImageProgramSetter) {
+        let data = Self { pixmap: None };
+        let arc = Arc::new((Mutex::new(data), Condvar::new()));
+        let need_redraw = Arc::new(AtomicBool::new(true));
+        (
+            ImageProgramDrawer {
+                _name: name.to_string(),
+                arc: arc.clone(),
+                need_redraw: need_redraw.clone(),
+            },
+            ImageProgramSetter {
+                _name: name.to_string(),
+                arc: arc.clone(),
+                need_redraw: need_redraw.clone(),
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImageProgramSetter {
+    _name: String,
+    arc: Arc<(Mutex<ImageProgramData>, Condvar)>,
+    need_redraw: Arc<AtomicBool>,
+}
+impl ImageProgramSetter {
+    pub fn set_image(&mut self, rgba: Vec<u8>, width: u32, height: u32) -> Option<Action> {
+        if rgba.len() == 0 {
+            return None;
+        }
+        let size = tiny_skia_path::IntSize::from_wh(width, height).expect("IntSize::from_wh");
+        let pixmap = Pixmap::from_vec(rgba, size).expect("Pixmap::from_vec");
+
+        let (lock, cvar) = &*self.arc;
+        let mut guard = lock.lock().unwrap();
+        let data = &mut *guard;
+        {
+            data.pixmap = Some(pixmap);
+            cvar.notify_one();
+        }
+
+        self.need_redraw.store(true, Ordering::Relaxed);
+        Some(Action::REDRAW)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImageProgramDrawer {
+    _name: String,
+    arc: Arc<(Mutex<ImageProgramData>, Condvar)>,
+    need_redraw: Arc<AtomicBool>,
+}
+impl ImageProgramDrawer {
+    pub fn need_redraw(&mut self) -> bool {
+        self.need_redraw.load(Ordering::Relaxed)
+    }
+    pub fn draw(&mut self, target: &mut Pixmap) {
+        //error!("[{}] > drawer draw", self.name);
+
+        let (lock, cvar) = &*self.arc;
+        let mut guard = lock.lock().unwrap();
+        while guard.pixmap.is_none() {
+            guard = cvar.wait(guard).unwrap();
+            //error!("[{}] wake", self.name);
+        }
+        if let Some(pixmap) = guard.pixmap.take() {
+            let paint = tiny_skia::PixmapPaint {
+                opacity: 1.0f32,
+                blend_mode: tiny_skia::BlendMode::Source,
+                quality: tiny_skia::FilterQuality::Nearest,
+            };
+            let tr = tiny_skia::Transform::identity();
+            target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, tr, None);
+        }
+        //error!("[{}] < drawer draw", self.name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageProgram {
+    _name: String,
+    drawer: ImageProgramDrawer,
+    setter: Option<ImageProgramSetter>,
+}
+impl Default for ImageProgram {
+    fn default() -> Self {
+        Self::new("default")
+    }
+}
+impl ImageProgram {
+    fn new(name: &str) -> Self {
+        let (drawer, setter) = ImageProgramData::new(name);
+        Self {
+            _name: name.to_string(),
+            drawer,
+            setter: Some(setter),
+        }
+    }
+    fn new_and_take_setter(name: &str) -> (Self, ImageProgramSetter) {
+        let mut pg = Self::new(name);
+        let setter = pg.take_setter();
+        (pg, setter)
+    }
+    fn take_setter(&mut self) -> ImageProgramSetter {
+        self.setter.take().unwrap()
+    }
+}
+impl CanvasProgram for ImageProgram {
+    fn need_redraw(&mut self) -> bool {
+        //error!("[{}] need redraw: {}", self.name, self.first);
+        self.drawer.need_redraw()
+    }
+    fn draw(&mut self, pixmap: &mut Pixmap) {
+        //error!("[{}] pg draw", self.name);
+        self.drawer.draw(pixmap);
+    }
+}
 
 impl_scope! {
-    #[derive(Clone, Debug, Default)]
-    #[widget]
+    #[widget{
+        layout = column: [ align(center): self.canvas ];
+    }]
+    #[derive(Clone, Debug)]
     pub struct Image {
         core: widget_core!(),
-        scaling: PixmapScaling,
-        handle: Option<ImageHandle>,
-        streamer: Option<Arc<Mutex<video::Frame>>>,
+        _name: String,
+        image_setter: ImageProgramSetter,
+        #[widget] canvas: Canvas<ImageProgram>,
     }
 
     impl Self {
-        pub fn new(width: f32, height: f32) -> Self {
-            let mut r = Self::default();
-            r.scaling.size = kas::layout::LogicalSize(width, height);
-            r
-        }
-
-        pub fn set_streamer(&mut self, streamer: Option<Arc<Mutex<video::Frame>>>, size: (u32, u32)) -> Option<Action> {
-            self.streamer = streamer;
-            if self.streamer.is_some() {
-                // TODO: Resizing is not called. Why?
-                self.scaling.size = kas::layout::LogicalSize::try_conv(size).unwrap();
-                self.scaling.fix_aspect = true;
-                Some(Action::RESIZE)
-            } else {
-                None
+        pub fn new(name: &str, width: u32, height: u32) -> Self {
+            let (pg, setter) = ImageProgram::new_and_take_setter(name);
+            let size = kas::layout::LogicalSize::try_conv((width, height)).unwrap();
+            let canvas = Canvas::new(pg).with_size(size);
+            Self {
+                core: Default::default(),
+                _name: name.to_string(),
+                image_setter: setter,
+                canvas,
             }
         }
-    }
 
-    impl Layout for Image {
-        fn size_rules(&mut self, size_mgr: SizeMgr, axis: AxisInfo) -> SizeRules {
-            self.scaling.size_rules(size_mgr, axis)
+        pub fn set_image(&mut self, rgba: Vec<u8>, width: u32, height: u32) -> Option<Action> {
+            return self.image_setter.set_image(rgba, width, height);
         }
-
-        fn set_rect(&mut self, mgr: &mut ConfigMgr, rect: Rect) {
-            let scale_factor = mgr.size_mgr().scale_factor();
-            self.core.rect = self.scaling.align_rect(rect, scale_factor);
-        }
-
-        fn draw(&mut self, mut draw: DrawMgr) {
-            if let Some(ref frame) = self.streamer {
-                if let Ok(f) = frame.lock() {
-                    let frame_size = kas::geom::Size::conv((f.width, f.height));
-                    let ds = draw.draw_shared();
-                    if let Some(image_size) = self.handle.as_ref().and_then(|ih| ds.image_size(ih)) {
-                        if image_size != frame_size {
-                            if let Some(ih) = self.handle.take() {
-                                ds.image_free(ih);
-                            }
-                        }
-                    }
-                    if self.handle.is_none() {
-                        self.handle = ds.image_alloc((f.width, f.height)).ok();
-                        self.scaling.size = kas::layout::LogicalSize::try_conv((f.width, f.height)).unwrap();
-                    }
-                    if let Some(ih) = &self.handle {
-                        ds.image_upload(ih, &f.data, kas::draw::ImageFormat::Rgba8);
-                    }
-               }
-            }
-            if let Some(id) = self.handle.as_ref().map(|h| h.id()) {
-                draw.image(self.rect(), id);
-            }
-         }
     }
 }

@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 kas = { version = "0.13.0", features = [] }
+tiny-skia-path = "0.8.2"                            # from IntSize from tiny_skia::Pixmap::from_vec from kas-resvc env_logger = "0.10.0"
 env_logger = "0.10.0"
 gstreamer = "0.20.6"
 gstreamer-app = "0.20.0"
